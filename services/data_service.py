@@ -25,8 +25,10 @@ POPULAR_SYMBOLS = [
     "SPY","QQQ","BRK-B","JNJ","UNH",
 ]
 
-_last_fetch: dict = {}
-MIN_FETCH_GAP = 2.0
+_last_fetch:  dict = {}
+_price_cache: dict = {}
+MIN_FETCH_GAP  = 2.0
+PRICE_CACHE_TTL = 300  # 5 minutes
 
 
 def _rate_limit(symbol: str):
@@ -125,13 +127,18 @@ def get_stock_info(symbol: str) -> dict:
         _rate_limit(symbol)
         info = yf.Ticker(symbol).info
         return {
-            "symbol": symbol, "name": info.get("longName", symbol),
-            "sector": info.get("sector","N/A"), "industry": info.get("industry","N/A"),
-            "market_cap": info.get("marketCap"), "pe_ratio": info.get("trailingPE"),
-            "52w_high": info.get("fiftyTwoWeekHigh"), "52w_low": info.get("fiftyTwoWeekLow"),
-            "avg_volume": info.get("averageVolume"), "beta": info.get("beta"),
+            "symbol":         symbol,
+            "name":           info.get("longName", symbol),
+            "sector":         info.get("sector", "N/A"),
+            "industry":       info.get("industry", "N/A"),
+            "market_cap":     info.get("marketCap"),
+            "pe_ratio":       info.get("trailingPE"),
+            "52w_high":       info.get("fiftyTwoWeekHigh"),
+            "52w_low":        info.get("fiftyTwoWeekLow"),
+            "avg_volume":     info.get("averageVolume"),
+            "beta":           info.get("beta"),
             "dividend_yield": info.get("dividendYield"),
-            "description": info.get("longBusinessSummary",""),
+            "description":    info.get("longBusinessSummary", ""),
         }
     except Exception as e:
         logger.warning(f"Could not fetch info for {symbol}: {e}")
@@ -139,22 +146,18 @@ def get_stock_info(symbol: str) -> dict:
 
 
 def get_current_price(symbol: str) -> dict:
-    # Price cache — 5 min
-    cache_file = os.path.join(CACHE_DIR, f"{symbol}_price.csv")
-    if os.path.exists(cache_file):
-        age_mins = (pd.Timestamp.now().timestamp() - os.path.getmtime(cache_file)) / 60
-        if age_mins < 5:
-            try:
-                return pd.read_csv(cache_file).iloc[0].to_dict()
-            except Exception:
-                pass
-
-    _rate_limit(symbol)
+    # In-memory cache check
+    now = time.time()
+    if symbol in _price_cache:
+        cached, ts = _price_cache[symbol]
+        if now - ts < PRICE_CACHE_TTL:
+            logger.info(f"Price cache hit for {symbol}")
+            return cached
 
     try:
         ticker = yf.Ticker(symbol)
 
-        # fast_info path
+        # fast_info path — quickest
         try:
             fi    = ticker.fast_info
             price = float(fi.last_price)
@@ -171,7 +174,7 @@ def get_current_price(symbol: str) -> dict:
                     "change":     round(change, 2),
                     "change_pct": round((change / prev * 100) if prev else 0, 2),
                 }
-                pd.DataFrame([result]).to_csv(cache_file, index=False)
+                _price_cache[symbol] = (result, now)
                 return result
         except Exception:
             pass
@@ -196,7 +199,7 @@ def get_current_price(symbol: str) -> dict:
             "change":     round(change, 2),
             "change_pct": round((change / prev * 100) if prev else 0, 2),
         }
-        pd.DataFrame([result]).to_csv(cache_file, index=False)
+        _price_cache[symbol] = (result, now)
         return result
 
     except Exception as e:
