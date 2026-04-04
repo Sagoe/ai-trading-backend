@@ -6,6 +6,8 @@ import pandas as pd
 import numpy as np
 import io
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from services.prediction_service import (
     train_predict_arima, train_predict_svr,
     ensemble_forecast, generate_signal
@@ -14,52 +16,45 @@ from services.data_service import add_technical_indicators
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _normalise_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardise column names to Title case and ensure Close exists."""
     df.columns = [c.strip().title() for c in df.columns]
-
-    # Accept 'Adj Close' as 'Close'
     if "Close" not in df.columns and "Adj Close" in df.columns:
         df["Close"] = df["Adj Close"]
-    # Accept 'Adj. Close'
     if "Close" not in df.columns:
         for c in df.columns:
             if "close" in c.lower():
                 df["Close"] = df[c]
                 break
-
     if "Close" not in df.columns:
         raise ValueError(
             f"CSV must contain a 'Close' column. "
             f"Columns found: {list(df.columns)}"
         )
-
     for col in ["Open", "High", "Low"]:
         if col not in df.columns:
             df[col] = df["Close"]
     if "Volume" not in df.columns:
-        df["Volume"] = 1  # avoid zero-volume OBV crash
-
+        df["Volume"] = 1
     return df
 
 
 def _parse_date_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Try to set a datetime index."""
     date_candidates = ["Date", "Datetime", "Timestamp", "Time",
                        "date", "datetime", "timestamp"]
     for col in date_candidates:
         if col in df.columns:
             try:
-                df[col] = pd.to_datetime(df[col], infer_datetime_format=True)
+                df[col] = pd.to_datetime(df[col])
                 df.set_index(col, inplace=True)
                 df.index.name = "Date"
                 return df
             except Exception:
                 pass
     try:
-        df.index = pd.to_datetime(df.index, infer_datetime_format=True)
+        df.index = pd.to_datetime(df.index)
         df.index.name = "Date"
     except Exception:
         df.index = pd.bdate_range(
@@ -69,16 +64,13 @@ def _parse_date_index(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@router.post("")
 @router.post("/")
 async def upload_csv(file: UploadFile = File(...)):
-    """
-    Accept a CSV with at least a 'Close' column (60+ rows).
-    Returns historical data + indicators + AI forecast + signal.
-    """
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
 
-    # ── Parse ────────────────────────────────────────────
+    # ── Parse ──
     try:
         contents = await file.read()
         df_raw = pd.read_csv(io.StringIO(contents.decode("utf-8")))
@@ -88,7 +80,7 @@ async def upload_csv(file: UploadFile = File(...)):
     if df_raw.empty:
         raise HTTPException(status_code=422, detail="CSV file is empty.")
 
-    # ── Normalise ────────────────────────────────────────
+    # ── Normalise ──
     try:
         df_raw = _normalise_df(df_raw)
         df_raw = _parse_date_index(df_raw)
@@ -102,10 +94,10 @@ async def upload_csv(file: UploadFile = File(...)):
     if len(df_raw) < 30:
         raise HTTPException(
             status_code=422,
-            detail=f"Need at least 30 rows. Your file has {len(df_raw)} usable rows after cleaning."
+            detail=f"Need at least 30 rows. Your file has {len(df_raw)} usable rows."
         )
 
-    # ── Technical indicators (need 30+ rows) ────────────
+    # ── Technical indicators ──
     try:
         df = add_technical_indicators(df_raw)
         if len(df) < 10:
@@ -117,27 +109,33 @@ async def upload_csv(file: UploadFile = File(...)):
     if df.empty or "Close" not in df.columns:
         raise HTTPException(status_code=422, detail="DataFrame is empty after processing.")
 
-    # ── Models ───────────────────────────────────────────
+    # ── Run ARIMA + SVR in parallel ──
     horizon = 10
+    loop = asyncio.get_event_loop()
 
-    arima_result = {"forecast": [], "metrics": {}}
-    svr_result   = {"forecast": [], "metrics": {}}
+    try:
+        arima_future = loop.run_in_executor(executor, train_predict_arima, df, horizon)
+        svr_future   = loop.run_in_executor(executor, train_predict_svr,   df, horizon)
+        arima_result, svr_result = await asyncio.gather(
+            arima_future, svr_future, return_exceptions=True
+        )
+    except Exception as e:
+        logger.error(f"Model execution failed: {e}")
+        arima_result = {"forecast": [], "metrics": {}}
+        svr_result   = {"forecast": [], "metrics": {}}
 
-    if len(df) >= 30:
-        try:
-            arima_result = train_predict_arima(df, horizon=horizon)
-        except Exception as e:
-            logger.error(f"ARIMA failed: {e}")
-
-        try:
-            svr_result = train_predict_svr(df, horizon=horizon)
-        except Exception as e:
-            logger.error(f"SVR failed: {e}")
+    # Handle exceptions from gather
+    if isinstance(arima_result, Exception):
+        logger.error(f"ARIMA failed: {arima_result}")
+        arima_result = {"forecast": [], "metrics": {}}
+    if isinstance(svr_result, Exception):
+        logger.error(f"SVR failed: {svr_result}")
+        svr_result = {"forecast": [], "metrics": {}}
 
     arima_preds = arima_result.get("forecast", [])
     svr_preds   = svr_result.get("forecast", [])
 
-    # Build ensemble — use whatever models worked
+    # ── Ensemble ──
     if arima_preds and svr_preds:
         ens = ensemble_forecast(svr_preds, arima_preds, svr_preds,
                                 weights=(0.5, 0.3, 0.2))
@@ -146,11 +144,10 @@ async def upload_csv(file: UploadFile = File(...)):
     elif svr_preds:
         ens = svr_preds
     else:
-        # Naive forecast: last price repeated
         last = float(df["Close"].iloc[-1])
-        ens = [round(last, 2)] * horizon
+        ens  = [round(last, 2)] * horizon
 
-    # ── Signal ───────────────────────────────────────────
+    # ── Signal ──
     current_price = float(df["Close"].iloc[-1])
     rsi_val = float(df["RSI"].iloc[-1]) if "RSI" in df.columns and not df["RSI"].isna().all() else None
 
@@ -160,20 +157,20 @@ async def upload_csv(file: UploadFile = File(...)):
         rsi=rsi_val,
     )
 
-    # ── Future dates ─────────────────────────────────────
+    # ── Future dates ──
     last_date    = df.index[-1]
     future_dates = pd.bdate_range(start=last_date, periods=horizon + 1)[1:]
     date_labels  = [d.strftime("%Y-%m-%d") for d in future_dates]
 
-    # ── History for chart (last 200 rows) ────────────────
+    # ── History for chart (last 150 rows) ──
     hist_df = df.reset_index()
     hist_df["Date"] = hist_df["Date"].astype(str)
-    float_cols = hist_df.select_dtypes(include=["float32","float64"]).columns
+    float_cols = hist_df.select_dtypes(include=["float32", "float64"]).columns
     hist_df[float_cols] = hist_df[float_cols].round(4)
-    history = hist_df.tail(200).to_dict(orient="records")
+    history = hist_df.tail(150).to_dict(orient="records")
 
-    # ── Summary stats ────────────────────────────────────
-    returns = df["Close"].pct_change().dropna()
+    # ── Summary stats ──
+    returns     = df["Close"].pct_change().dropna()
     first_price = float(df["Close"].iloc[0])
     total_return = ((current_price - first_price) / first_price * 100) if first_price else 0
 
@@ -186,12 +183,12 @@ async def upload_csv(file: UploadFile = File(...)):
         "signal":        signal,
         "rsi":           round(rsi_val, 2) if rsi_val is not None else None,
         "summary": {
-            "min":               round(float(df["Close"].min()), 2),
-            "max":               round(float(df["Close"].max()), 2),
-            "mean":              round(float(df["Close"].mean()), 2),
-            "std":               round(float(df["Close"].std()), 2),
-            "return_total_pct":  round(total_return, 2),
-            "volatility_daily":  round(float(returns.std()), 4),
+            "min":              round(float(df["Close"].min()), 2),
+            "max":              round(float(df["Close"].max()), 2),
+            "mean":             round(float(df["Close"].mean()), 2),
+            "std":              round(float(df["Close"].std()), 2),
+            "return_total_pct": round(total_return, 2),
+            "volatility_daily": round(float(returns.std()), 4),
         },
         "forecast": {
             "dates":    date_labels,
