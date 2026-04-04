@@ -11,7 +11,7 @@ from ta.trend import MACD, EMAIndicator, SMAIndicator
 from ta.volatility import BollingerBands
 from ta.volume import OnBalanceVolumeIndicator
 from sklearn.preprocessing import MinMaxScaler
-import logging, os, time, random
+import logging, os, time, random, requests
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ POPULAR_SYMBOLS = [
 
 _last_fetch:  dict = {}
 _price_cache: dict = {}
-MIN_FETCH_GAP  = 2.0
+MIN_FETCH_GAP   = 2.0
 PRICE_CACHE_TTL = 300  # 5 minutes
 
 
@@ -38,6 +38,39 @@ def _rate_limit(symbol: str):
     if gap < MIN_FETCH_GAP:
         time.sleep(MIN_FETCH_GAP - gap + random.uniform(0.1, 0.5))
     _last_fetch[symbol] = time.time()
+
+
+def _get_price_alpha_vantage(symbol: str) -> dict | None:
+    """Fallback to Alpha Vantage when yfinance is blocked."""
+    try:
+        av_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+        if not av_key:
+            return None
+        url  = (
+            f"https://www.alphavantage.co/query"
+            f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={av_key}"
+        )
+        r    = requests.get(url, timeout=10)
+        data = r.json().get("Global Quote", {})
+        price = float(data.get("05. price", 0))
+        if price <= 0:
+            return None
+        prev   = float(data.get("08. previous close", price))
+        change = float(data.get("09. change", 0))
+        chpct  = float(data.get("10. change percent", "0%").replace("%", ""))
+        return {
+            "symbol":     symbol,
+            "price":      round(price, 2),
+            "open":       round(float(data.get("02. open", price)), 2),
+            "high":       round(float(data.get("03. high", price)), 2),
+            "low":        round(float(data.get("04. low",  price)), 2),
+            "volume":     int(data.get("06. volume", 0)),
+            "change":     round(change, 2),
+            "change_pct": round(chpct, 2),
+        }
+    except Exception as e:
+        logger.error(f"Alpha Vantage failed for {symbol}: {e}")
+        return None
 
 
 def fetch_ohlcv(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
@@ -154,54 +187,59 @@ def get_current_price(symbol: str) -> dict:
             logger.info(f"Price cache hit for {symbol}")
             return cached
 
+    # ── Try yfinance fast_info ──
     try:
         ticker = yf.Ticker(symbol)
+        fi     = ticker.fast_info
+        price  = float(fi.last_price)
+        if price and price > 0:
+            prev   = float(fi.previous_close or price)
+            change = price - prev
+            result = {
+                "symbol":     symbol,
+                "price":      round(price, 2),
+                "open":       round(float(fi.open or price), 2),
+                "high":       round(float(fi.day_high or price), 2),
+                "low":        round(float(fi.day_low  or price), 2),
+                "volume":     int(fi.last_volume or 0),
+                "change":     round(change, 2),
+                "change_pct": round((change / prev * 100) if prev else 0, 2),
+            }
+            _price_cache[symbol] = (result, now)
+            return result
+    except Exception as e:
+        logger.warning(f"yfinance fast_info failed for {symbol}: {e}")
 
-        # fast_info path — quickest
-        try:
-            fi    = ticker.fast_info
-            price = float(fi.last_price)
-            if price and price > 0:
-                prev   = float(fi.previous_close or price)
-                change = price - prev
-                result = {
-                    "symbol":     symbol,
-                    "price":      round(price, 2),
-                    "open":       round(float(fi.open or price), 2),
-                    "high":       round(float(fi.day_high or price), 2),
-                    "low":        round(float(fi.day_low  or price), 2),
-                    "volume":     int(fi.last_volume or 0),
-                    "change":     round(change, 2),
-                    "change_pct": round((change / prev * 100) if prev else 0, 2),
-                }
-                _price_cache[symbol] = (result, now)
-                return result
-        except Exception:
-            pass
+    # ── Try yfinance history fallback ──
+    try:
+        ticker = yf.Ticker(symbol)
+        hist   = ticker.history(period="5d", interval="1d", auto_adjust=True)
+        if hist is not None and not hist.empty:
+            hist.dropna(subset=["Close"], inplace=True)
+            latest = hist.iloc[-1]
+            prev   = float(hist.iloc[-2]["Close"]) if len(hist) > 1 else float(latest["Close"])
+            price  = float(latest["Close"])
+            change = price - prev
+            result = {
+                "symbol":     symbol,
+                "price":      round(price, 2),
+                "open":       round(float(latest.get("Open", price)), 2),
+                "high":       round(float(latest.get("High", price)), 2),
+                "low":        round(float(latest.get("Low",  price)), 2),
+                "volume":     int(latest.get("Volume", 0)),
+                "change":     round(change, 2),
+                "change_pct": round((change / prev * 100) if prev else 0, 2),
+            }
+            _price_cache[symbol] = (result, now)
+            return result
+    except Exception as e:
+        logger.warning(f"yfinance history failed for {symbol}: {e}")
 
-        # history fallback
-        hist = ticker.history(period="5d", interval="1d", auto_adjust=True)
-        if hist is None or hist.empty:
-            raise ValueError(f"Empty history for {symbol}")
-
-        hist.dropna(subset=["Close"], inplace=True)
-        latest = hist.iloc[-1]
-        prev   = float(hist.iloc[-2]["Close"]) if len(hist) > 1 else float(latest["Close"])
-        price  = float(latest["Close"])
-        change = price - prev
-        result = {
-            "symbol":     symbol,
-            "price":      round(price, 2),
-            "open":       round(float(latest.get("Open", price)), 2),
-            "high":       round(float(latest.get("High", price)), 2),
-            "low":        round(float(latest.get("Low",  price)), 2),
-            "volume":     int(latest.get("Volume", 0)),
-            "change":     round(change, 2),
-            "change_pct": round((change / prev * 100) if prev else 0, 2),
-        }
+    # ── Fallback to Alpha Vantage ──
+    logger.info(f"Trying Alpha Vantage for {symbol}...")
+    result = _get_price_alpha_vantage(symbol)
+    if result:
         _price_cache[symbol] = (result, now)
         return result
 
-    except Exception as e:
-        logger.error(f"get_current_price failed for {symbol}: {e}")
-        raise ValueError(f"Could not fetch price for {symbol}: {e}")
+    raise ValueError(f"Could not fetch price for {symbol} from any source")
