@@ -3,7 +3,7 @@ services:
     name: ai-trading-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 120 --workers 1
     envVars:
       - key: APP_ENV
         value: production
